@@ -153,7 +153,7 @@ executed_queries:
   returned: success
   type: list
   elements: str
-  sample: ["ALTER SYSTEM SET shared_preload_libraries = ''"]
+  sample: ["ALTER SYSTEM SET \"shared_preload_libraries\" = ''"]
 
 restart_required:
   description:
@@ -618,8 +618,7 @@ class PgParam():
         self.module = module
         self.cursor = cursor
         self.name = name
-        # A dotted GUC is one configuration name, not a schema-qualified object.
-        self.sql_name = pg_quote_name(name) if '.' in name else name
+        self.sql_name = '.'.join(pg_quote_name(part) for part in name.split('.'))
         self.pg_ver = pg_ver
 
         self.attrs = self.get_attrs()

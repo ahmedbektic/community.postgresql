@@ -400,14 +400,16 @@ def m_pg_cursor(mocker, monkeypatch):
 
 
 @pytest.mark.parametrize('name,value,sql_name,sql_value,pg_ver', [
-    ('work_mem', '8192', 'work_mem', "'8192'", 140000),
+    ('work_mem', '8192', '"work_mem"', "'8192'", 140000),
+    ('UPPERCASE', 'on', '"UPPERCASE"', "'on'", 140000),
+    ('TimeZone', 'Europe/Paris', '"TimeZone"', "'Europe/Paris'", 140000),
     ('shared_preload_libraries', 'pg_stat_statements, pgcrypto',
-     'shared_preload_libraries', "'pg_stat_statements','pgcrypto'", 140000),
-    ('pg_stat_statements.track', 'all', '"pg_stat_statements.track"', "'all'", 140000),
-    ('online_analyze.verbose', 'on', '"online_analyze.verbose"', "'on'", 140000),
-    ('online_analyze.something', 'a, b', '"online_analyze.something"', "'a','b'", 140000),
-    ('custom.subsystem.option', 'on', '"custom.subsystem.option"', "'on'", 140000),
-    ('online_analyze.verbose', 'on', '"online_analyze.verbose"', 'on', 130000),
+     '"shared_preload_libraries"', "'pg_stat_statements','pgcrypto'", 140000),
+    ('pg_stat_statements.track', 'all', '"pg_stat_statements"."track"', "'all'", 140000),
+    ('online_analyze.verbose', 'on', '"online_analyze"."verbose"', "'on'", 140000),
+    ('online_analyze.something', 'a, b', '"online_analyze"."something"', "'a','b'", 140000),
+    ('Custom.SUBSYSTEM.option', 'on', '"Custom"."SUBSYSTEM"."option"', "'on'", 140000),
+    ('online_analyze.verbose', 'on', '"online_analyze"."verbose"', 'on', 130000),
 ])
 @pytest.mark.parametrize('check_mode', [False, True])
 def test_pg_param_set(m_ansible_module, m_pg_cursor, name, value, sql_name, sql_value, pg_ver, check_mode):
@@ -424,9 +426,11 @@ def test_pg_param_set(m_ansible_module, m_pg_cursor, name, value, sql_name, sql_
 
 
 @pytest.mark.parametrize('name,sql_name', [
-    ('work_mem', 'work_mem'),
-    ('online_analyze.verbose', '"online_analyze.verbose"'),
-    ('custom.subsystem.option', '"custom.subsystem.option"'),
+    ('work_mem', '"work_mem"'),
+    ('UPPERCASE', '"UPPERCASE"'),
+    ('TimeZone', '"TimeZone"'),
+    ('online_analyze.verbose', '"online_analyze"."verbose"'),
+    ('Custom.SUBSYSTEM.option', '"Custom"."SUBSYSTEM"."option"'),
 ])
 @pytest.mark.parametrize('check_mode', [False, True])
 def test_pg_param_reset(m_ansible_module, m_pg_cursor, name, sql_name, check_mode):
@@ -477,10 +481,14 @@ def test_pg_param_unknown_name_fails_before_alter_system(mocker, m_pg_cursor, na
     assert postgresql_alter_system.executed_queries == []
 
 
-@pytest.mark.parametrize('name', ['online_analyze.verbose', '"online_analyze.verbose"'])
+@pytest.mark.parametrize('name,logical_name,sql_name', [
+    ('online_analyze.verbose', 'online_analyze.verbose', '"online_analyze"."verbose"'),
+    ('"online_analyze.verbose"', 'online_analyze.verbose', '"online_analyze"."verbose"'),
+    ('"Select.From.MixedCase"', 'Select.From.MixedCase', '"Select"."From"."MixedCase"'),
+])
 @pytest.mark.parametrize('value', ['on', '_RESET'])
 @pytest.mark.parametrize('check_mode', [False, True])
-def test_main_quoted_and_unquoted_names(mocker, m_pg_cursor, name, value, check_mode):
+def test_main_quoted_and_unquoted_names(mocker, m_pg_cursor, name, logical_name, sql_name, value, check_mode):
     module = mocker.MagicMock()
     module.params = dict(param=name, value=value, session_role=None, trust_input=False)
     module.check_mode = check_mode
@@ -503,9 +511,9 @@ def test_main_quoted_and_unquoted_names(mocker, m_pg_cursor, name, value, check_
     metadata_calls = [call for call in m_pg_cursor.execute.call_args_list
                       if call.args[0].startswith('SELECT setting')]
     assert len(metadata_calls) == 2
-    assert all(call.args[1] == ('online_analyze.verbose',) for call in metadata_calls)
-    query = ('ALTER SYSTEM RESET "online_analyze.verbose"' if value == '_RESET'
-             else 'ALTER SYSTEM SET "online_analyze.verbose" = \'on\'')
+    assert all(call.args[1] == (logical_name,) for call in metadata_calls)
+    query = ('ALTER SYSTEM RESET %s' % sql_name if value == '_RESET'
+             else "ALTER SYSTEM SET %s = 'on'" % sql_name)
     queries = [query, 'SELECT pg_reload_conf()']
     assert postgresql_alter_system.executed_queries == queries
     assert [call.args[0] for call in m_pg_cursor.execute.call_args_list
