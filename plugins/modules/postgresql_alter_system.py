@@ -24,7 +24,8 @@ options:
   param:
     description:
     - Name of PostgreSQL server parameter.
-    - Pass the name without SQL quotes, including for dotted names such as C(online_analyze.verbose).
+    - Accepts a logical name such as C(online_analyze.verbose), optionally enclosed in SQL double quotes.
+    - Dotted names are treated as one configuration parameter name.
     type: str
     required: true
 
@@ -167,7 +168,7 @@ restart_required:
 from ansible.module_utils.basic import AnsibleModule
 from ansible.module_utils.common.text.converters import to_native
 from ansible_collections.community.postgresql.plugins.module_utils.database import \
-    check_input, pg_quote_name
+    check_input, pg_quote_name, pg_unquote_name
 from ansible_collections.community.postgresql.plugins.module_utils.postgres import (
     connect_to_db,
     ensure_required_libs,
@@ -801,7 +802,8 @@ def main():
         supports_check_mode=True,
     )
 
-    param = module.params['param']
+    # Normalize once, before parameter-specific checks and metadata lookups.
+    param = pg_unquote_name(module.params['param'])
     value = module.params['value']
     session_role = module.params['session_role']
     trust_input = module.params['trust_input']
@@ -813,7 +815,7 @@ def main():
 
     if not trust_input:
         # Check input for potentially dangerous elements
-        check_input(module, param, value, session_role)
+        check_input(module, module.params['param'], value, session_role)
 
     # Ensure psycopg libraries are available before connecting to DB
     ensure_required_libs(module)

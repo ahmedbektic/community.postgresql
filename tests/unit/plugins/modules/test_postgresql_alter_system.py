@@ -399,17 +399,20 @@ def m_pg_cursor(mocker, monkeypatch):
     return cursor
 
 
-@pytest.mark.parametrize('name,value,sql_name,sql_value', [
-    ('work_mem', '8192', 'work_mem', "'8192'"),
+@pytest.mark.parametrize('name,value,sql_name,sql_value,pg_ver', [
+    ('work_mem', '8192', 'work_mem', "'8192'", 140000),
     ('shared_preload_libraries', 'pg_stat_statements, pgcrypto',
-     'shared_preload_libraries', "'pg_stat_statements','pgcrypto'"),
-    ('pg_stat_statements.track', 'all', '"pg_stat_statements.track"', "'all'"),
-    ('online_analyze.verbose', 'on', '"online_analyze.verbose"', "'on'"),
+     'shared_preload_libraries', "'pg_stat_statements','pgcrypto'", 140000),
+    ('pg_stat_statements.track', 'all', '"pg_stat_statements.track"', "'all'", 140000),
+    ('online_analyze.verbose', 'on', '"online_analyze.verbose"', "'on'", 140000),
+    ('online_analyze.something', 'a, b', '"online_analyze.something"', "'a','b'", 140000),
+    ('custom.subsystem.option', 'on', '"custom.subsystem.option"', "'on'", 140000),
+    ('online_analyze.verbose', 'on', '"online_analyze.verbose"', 'on', 130000),
 ])
 @pytest.mark.parametrize('check_mode', [False, True])
-def test_pg_param_set(m_ansible_module, m_pg_cursor, name, value, sql_name, sql_value, check_mode):
+def test_pg_param_set(m_ansible_module, m_pg_cursor, name, value, sql_name, sql_value, pg_ver, check_mode):
     m_ansible_module.check_mode = check_mode
-    param = PgParam(m_ansible_module, m_pg_cursor, name, 140000)
+    param = PgParam(m_ansible_module, m_pg_cursor, name, pg_ver)
     # Metadata receives the logical name, without SQL quoting.
     assert m_pg_cursor.execute.call_args[0][1] == (name,)
     m_pg_cursor.reset_mock()
@@ -423,6 +426,7 @@ def test_pg_param_set(m_ansible_module, m_pg_cursor, name, value, sql_name, sql_
 @pytest.mark.parametrize('name,sql_name', [
     ('work_mem', 'work_mem'),
     ('online_analyze.verbose', '"online_analyze.verbose"'),
+    ('custom.subsystem.option', '"custom.subsystem.option"'),
 ])
 @pytest.mark.parametrize('check_mode', [False, True])
 def test_pg_param_reset(m_ansible_module, m_pg_cursor, name, sql_name, check_mode):
@@ -449,13 +453,79 @@ def test_pg_param_set_idempotent(m_ansible_module, m_pg_cursor, check_mode):
     m_pg_cursor.execute.assert_not_called()
 
 
-def test_pg_param_prequoted_name_is_not_metadata(mocker, m_pg_cursor):
+@pytest.mark.parametrize('name', [
+    'work mem',
+    'work%mem',
+    'custom..option',
+    'custom.subsystem.option',
+    '"online_analyze.verbose',
+])
+def test_pg_param_unknown_name_fails_before_alter_system(mocker, m_pg_cursor, name):
     module = mocker.MagicMock()
     module.fail_json.side_effect = ValueError
+    # Even syntactically valid names must be registered in pg_settings.
     m_pg_cursor.fetchall.return_value = []
 
     with pytest.raises(ValueError):
-        PgParam(module, m_pg_cursor, '"online_analyze.verbose"', 140000)
+        PgParam(module, m_pg_cursor, name, 140000)
 
-    assert m_pg_cursor.execute.call_args[0][1] == ('"online_analyze.verbose"',)
-    module.fail_json.assert_called_once_with(msg='Parameter "online_analyze.verbose" does not exist')
+    module.fail_json.assert_called_once_with(msg='Parameter %s does not exist' % name)
+    m_pg_cursor.execute.assert_called_once_with(
+        'SELECT setting, unit, context, vartype, enumvals, '
+        'boot_val, min_val, max_val, pending_restart '
+        'FROM pg_catalog.pg_settings where name = %s', (name,))
+    assert postgresql_alter_system.executed_queries == []
+
+
+@pytest.mark.parametrize('name', ['online_analyze.verbose', '"online_analyze.verbose"'])
+@pytest.mark.parametrize('value', ['on', '_RESET'])
+@pytest.mark.parametrize('check_mode', [False, True])
+def test_main_quoted_and_unquoted_names(mocker, m_pg_cursor, name, value, check_mode):
+    module = mocker.MagicMock()
+    module.params = dict(param=name, value=value, session_role=None, trust_input=False)
+    module.check_mode = check_mode
+    mocker.patch.object(postgresql_alter_system, 'AnsibleModule', return_value=module)
+    mocker.patch.object(postgresql_alter_system, 'ensure_required_libs')
+    mocker.patch.object(postgresql_alter_system, 'get_conn_params', return_value={})
+    mocker.patch.object(postgresql_alter_system, 'pg_cursor_args', {})
+    connection = mocker.MagicMock()
+    connection.cursor.return_value = m_pg_cursor
+    mocker.patch.object(postgresql_alter_system, 'connect_to_db', return_value=(connection, None))
+    mocker.patch.object(postgresql_alter_system, 'get_server_version', return_value=140000)
+    check_input = mocker.spy(postgresql_alter_system, 'check_input')
+    m_pg_cursor.fetchall.return_value = [dict(
+        setting='off', unit=None, context='user', vartype='bool', enumvals=None,
+        boot_val='off', min_val=None, max_val=None, pending_restart=False,
+    )]
+
+    postgresql_alter_system.main()
+
+    metadata_calls = [call for call in m_pg_cursor.execute.call_args_list
+                      if call.args[0].startswith('SELECT setting')]
+    assert len(metadata_calls) == 2
+    assert all(call.args[1] == ('online_analyze.verbose',) for call in metadata_calls)
+    query = ('ALTER SYSTEM RESET "online_analyze.verbose"' if value == '_RESET'
+             else 'ALTER SYSTEM SET "online_analyze.verbose" = \'on\'')
+    queries = [query, 'SELECT pg_reload_conf()']
+    assert postgresql_alter_system.executed_queries == queries
+    assert [call.args[0] for call in m_pg_cursor.execute.call_args_list
+            if call not in metadata_calls] == ([] if check_mode else queries)
+    check_input.assert_called_once_with(module, name, value, None)
+    module.exit_json.assert_called_once()
+    assert module.exit_json.call_args.kwargs['changed'] is True
+
+
+@pytest.mark.parametrize('name', ['shared_preload_libraries', '"shared_preload_libraries"'])
+def test_main_quoted_name_cannot_bypass_problematic_param_check(mocker, name):
+    module = mocker.MagicMock()
+    module.params = dict(param=name, value='', session_role=None, trust_input=True)
+    module.fail_json.side_effect = ValueError
+    mocker.patch.object(postgresql_alter_system, 'AnsibleModule', return_value=module)
+    ensure_libs = mocker.patch.object(postgresql_alter_system, 'ensure_required_libs', side_effect=AssertionError)
+
+    with pytest.raises(ValueError):
+        postgresql_alter_system.main()
+
+    module.fail_json.assert_called_once()
+    assert 'Use `value: _RESET` instead.' in module.fail_json.call_args.kwargs['msg']
+    ensure_libs.assert_not_called()
